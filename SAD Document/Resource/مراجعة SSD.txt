@@ -1,0 +1,408 @@
+ملخص مراجعة وثيقة SSD والقرارات المعمارية — UCS
+1. التقييم العام لوثيقة SSD
+تمت مراجعة وثيقة الـSSD بشكل شامل من ناحية:
+• Architecture
+• Modular Monolith Design
+• Database Architecture
+• Tenant Isolation
+• Cache Architecture
+• Event-driven architecture
+• FSM
+• Idempotency
+• Background Workers
+• Security
+• Testing
+• Backup & Recovery
+• Resource Consumption
+• Consistency مع الـBRD
+• قابلية التنفيذ والتوسع
+التقييم العام
+حوالي 8.9 / 10
+الوثيقة تعتبر قوية جدًا من ناحية التصميم الهندسي، والمشكلة الأساسية ليست أن الـArchitecture خاطئة، وإنما أن هناك بعض النقاط التي تحتاج Architecture Consistency Pass قبل تثبيت التصميم نهائيًا.
+بمعنى:
+الوثيقة لا تحتاج إعادة تصميم شاملة؛ تحتاج إزالة التناقضات، تثبيت بعض القرارات، وربط الـBRD بالـSSD بصورة أكثر صرامة.
+2. نقاط القوة الرئيسية في الـSSD
+من أقوى الأشياء الموجودة في التصميم:
+Modular Monolith
+النظام مصمم كـModular Monolith مع فصل واضح بين الوحدات.
+كل Module يمتلك بياناته ومنطقه، مع وجود Kernel مشترك للوظائف الأساسية.
+Database
+التصميم يعتمد على:
+• PostgreSQL
+• Database واحدة
+• Schema منفصلة لكل Module
+• Tenant isolation باستخدام المفاتيح/السياق وليس فصل Database لكل Tenant.
+Module Ownership
+القاعدة الأساسية:
+كل Module يمتلك بياناته، ولا يسمح للـModules الأخرى بالقراءة المباشرة من Schema الخاصة به.
+والتواصل يتم من خلال:
+• API Contracts
+• Events
+• Read Projections عند الحاجة
+مع منع الـcross-schema joins المباشرة.
+Cache
+تم تصميم Redis باستخدام Namespace/Key isolation.
+مثلًا:
+{tenant}:{module}:{resource}:{id} 
+بحيث لا تستطيع وحدة قراءة Cache الخاصة بوحدة أخرى.
+وفي نفس الوقت توجد مساحة مشتركة:
+common 
+للبيانات العامة التي يسمح بمشاركتها.
+والـlive exam state والإجابات لا تعتمد على Redis كـcache.
+3. أهم نقاط الـArchitecture الموجودة في الوثيقة
+الـSSD يحتوي على:
+• Kernel
+• Tenant Context
+• FSM
+• Outbox
+• Idempotency
+• Cache
+• Audit
+• Files Core
+• Background Workers
+• Event Handlers
+والـModules الأساسية تشمل:
+• AUTH
+• OWN
+• ADM
+• FAC
+• ATT
+• EXM
+• CHT
+• PRC
+• GRD
+• PAY
+• CHA
+• FIL
+• NOT
+• DSH
+• SET
+بالإضافة إلى Kernel.
+4. أهم الـExam Flow
+الـExam FSM هو:
+DRAFT ↓ REQUESTED ↓ SCHEDULED ↓ READY ↓ LIVE ↓ ENDED ↓ GRADING ↓ GRADED ↓ PUBLISHED 
+عملية START وEND system-only.
+عند بداية الامتحان:
+exm.ExamSessionStarted.v1 
+ويتم فتح المراقبة في PRC.
+وعند النهاية:
+exm.ExamSessionEnded.v1 
+مع Auto-submit للطلاب الذين لم يسلموا.
+5. Idempotency
+الـSSD يحتوي على Idempotency paths مهمة، منها:
+PUT /exm/submissions/:id/answers 
+لحفظ إجابات الامتحان.
+وكذلك:
+POST /prc/submissions/:id/events 
+لأحداث الـIntegrity.
+و:
+POST /att/sessions/:id/uploads 
+ويتم استخدام:
+Idempotency-Key 
+مع UUIDv7 يتم توليده من الـclient وحفظه محليًا قبل الإرسال.
+وهذا مهم جدًا أثناء الامتحانات لأن الشبكة قد تعيد إرسال نفس الطلب.
+6. تحديد أثقل وحدات النظام أثناء الامتحان
+في البداية تم تحديد ثلاث وحدات مرشحة للضغط العالي:
+• EXM — Exam Sessions
+• PRC — Integrity / Anti-Cheating
+• ATT — Attendance
+لكن تم تصحيح هذا الاستنتاج.
+ATT ليست Hot Path رئيسية للامتحان
+لأن تسجيل الحضور حسب طريقة تشغيل النظام يتم:
+طالبًا بطالب أثناء دخول الطلاب إلى القاعة.
+وبالتالي لا توجد نفس الـconcurrency الموجودة في:
+• حفظ الإجابات
+• submission
+• exam state
+• integrity events
+لذلك تم استبعاد ATT من كونها وحدة تستحق Rust فقط بسبب ضغط الامتحان.
+7. القرار النهائي بالنسبة لـRust
+تم تثبيت القرار على:
+EXM + PRC
+أي:
+EXM — Exam Sessions
+وهي أهم وحدة في الـhot path بسبب:
+• Answer saves
+• Submissions
+• Autosave
+• Exam session state
+• Exam start/end
+• عدد كبير من الطلبات المتزامنة.
+PRC — Integrity / Anti-Cheating
+لأنها تعمل بالتوازي مع الامتحان وتتلقى:
+• Integrity events
+• Device events
+• Monitoring data
+• Anti-cheating signals
+وبالتالي فإنها أيضًا جزء من الـexam hot path.
+القرار المعماري
+Rust is used for the two highest-concurrency examination hot-path modules: EXM (Exam Sessions) and PRC (Integrity / Anti-Cheating).
+أما باقي الـModules فتظل NestJS/TypeScript، ولا يتم نقلها إلى Rust إلا إذا أظهرت الـprofiling أو الـload testing حاجة فعلية لذلك.
+8. لماذا Rust مهم هنا؟
+تم توضيح أن Rust لا يعني تلقائيًا استهلاك RAM أقل.
+الفائدة الأساسية في هذه الحالة هي:
+• High concurrency
+• Async processing
+• Low runtime overhead
+• Efficient memory management
+• High throughput
+• التحكم الأفضل في concurrency
+• تقليل الضغط على NestJS في الـhot path
+لكن Rust وحده لا يحل المشكلة.
+إذا كان هناك:
+• Query سيئة
+• Connections كثيرة
+• Allocations غير ضرورية
+• Payloads ضخمة
+• سوء إدارة للـconcurrency
+فإن Rust لن ينقذ النظام.
+لذلك:
+Rust + Architecture جيدة + Database tuning + bounded concurrency + Load Testing
+هي التركيبة المهمة.
+9. RAM قبل وبعد إدخال Rust
+تمت مناقشة أن السيرفر الحالي/المستهدف محدود الموارد، خصوصًا إذا كان:
+4 GB RAM 2 vCPU 
+والـstack يحتوي على:
+• PostgreSQL
+• PgBouncer
+• Redis
+• BullMQ
+• NestJS API
+• Worker
+• Rust EXM
+• Rust PRC
+• Garage
+• Nginx
+• Monitoring
+• Backup processes
+وهذا يجعل 4GB tight عند الضغط العالي.
+10. تقدير RAM أثناء الامتحان
+تم تقدير الاستهلاك في سيناريو:
+• 500 إلى 2,000 طالب
+• دخول متقارب
+• حفظ الإجابات تقريبًا كل 15 ثانية
+• EXM + PRC بـRust
+• PostgreSQL
+• Redis
+• NestJS/API + Worker
+• Garage/Nginx/Monitoring
+التقديرات:
+الطلابRAM المتوقعة5001.7 – 2.5 GB7501.84 – 2.64 GB1,0001.95 – 2.79 GB1,2502.05 – 2.92 GB1,5002.16 – 3.04 GB1,7502.26 – 3.18 GB2,0002.37 – 3.37 GB 
+هذه ليست قياسات production؛ هي engineering estimates للتخطيط.
+11. توزيع تقريبي للـRAM عند 2,000 طالب
+في السيناريو الأعلى تم تقدير:
+EXM Rust
+140–250 MB 
+PRC Rust
+120–190 MB 
+NestJS/API + Worker
+550–850 MB 
+PostgreSQL
+1.0–1.3 GB 
+Redis
+210–280 MB 
+باقي الخدمات
+350–500 MB 
+الإجمالي:
+≈ 2.37 – 3.37 GB 
+12. معنى هذا بالنسبة لـ4GB
+عند 2,000 طالب:
+RAM usage ≈ 2.4 – 3.4 GB 
+نظريًا يبقى:
+≈ 0.6 – 1.6 GB 
+من أصل 4GB.
+لكن لا ينبغي اعتبار كل هذه المساحة متاحة للتطبيق، لأن هناك:
+• OS
+• Filesystem cache
+• Bursts
+• Runtime overhead
+• PostgreSQL fluctuations
+• Background jobs
+• Monitoring
+• Backup
+• Unexpected traffic
+لذلك 4GB عند 2,000 طالب تصبح منطقة تحتاج Load Testing ومراقبة فعلية.
+13. تقييم 4GB حسب عدد الطلاب
+الطلابتقييم 4GB500🟢 ممتاز750🟢 جيد جدًا1,000🟢 جيد1,250🟢/🟡1,500🟡1,750🟡2,000🟠 يحتاج Load Test 
+14. ماذا عن 8GB؟
+8GB تجعل الوضع أكثر راحة بكثير.
+عند 2,000 طالب واستهلاك تقريبي:
+2.4 – 3.4 GB 
+يبقى تقريبًا:
+4.6 – 5.6 GB 
+للنظام والـheadroom والـbursts.
+لذلك:
+8GB RAM + 4 vCPU تعتبر Upgrade طبيعية ومنطقية إذا كان 2,000 طالب في امتحان واحد هدفًا حقيقيًا وليس مجرد حد نظري.
+15. الاستنتاج الأهم حول Rust
+تم تصحيح الفكرة من:
+"Rust يحل مشكلة RAM"
+إلى:
+Rust يحل جزءًا كبيرًا من مشكلة الـconcurrency والـCPU والـthroughput في الـexam hot path، وليس 80% من RAM حرفيًا.
+إضافة Rust إلى EXM + PRC تجعل النظام أفضل في التعامل مع:
+• آلاف الطلبات المتزامنة
+• Answer saves
+• Integrity events
+• Submission bursts
+• Exam start/end
+• High concurrency
+لكن RAM لا تزال تعتمد بشكل كبير على:
+• PostgreSQL
+• Node/NestJS
+• Worker
+• Redis
+• Connection pools
+• Background jobs
+• OS overhead
+16. النقطة التي وصلنا إليها في النهاية
+الفكرة الأساسية أصبحت:
+إذا كانت EXM وPRC مصممتين جيدًا بـRust، فقد تم حل جزء كبير من مشكلة الـhot path والـconcurrency.
+ثم يصبح الجزء المتبقي متعلقًا بدرجة كبيرة بـجودة الكود والتنفيذ.
+أي أن المعادلة أصبحت تقريبًا:
+Architecture + Rust Hot Paths + PostgreSQL Optimization + Connection Management + Bounded Concurrency + Good Code + Load Testing = Exam Capacity 
+وليس:
+RAM فقط = عدد الطلاب 
+17. النقاط التي تحتاج حل ومعالجة
+P0 — يجب حلها قبل تثبيت الـArchitecture
+1. Canonical Module Map
+يجب إنشاء جدول واحد رسمي يحدد:
+• كل Module
+• اسمه الرسمي
+• schema
+• owner
+• dependencies
+• events
+• APIs
+• read projections
+حتى لا تظهر أسماء مختلفة لنفس الوحدة بين BRD وSSD.
+2. حسم قاعدة Cross-Schema Access
+يجب تثبيت القاعدة رسميًا:
+No direct cross-schema reads/joins. 
+وتحديد الحالات الاستثنائية بدقة:
+• API Contract
+• Event
+• Read Projection
+• Materialized View
+خصوصًا الـDashboard والـReporting.
+3. مراجعة Tenant Isolation
+خصوصًا:
+• DSH
+• Materialized Views
+• Read Projections
+• Queries
+• RLS
+والتأكد أن Tenant A لا يمكن أن يرى بيانات Tenant B بأي مسار.
+ويجب تحويل هذا إلى Automated Isolation Tests.
+4. BRD ↔ SSD Traceability
+عمل Matrix تربط:
+BRD Requirement ↓ Function ↓ Module ↓ API/Event ↓ Database ↓ Test 
+وهذه من أهم الأشياء التي سترفع جودة التوثيق من ممتاز إلى مستوى احترافي جدًا.
+18. P1 — مشاكل تحتاج حسم قبل التنفيذ النهائي
+5. مراجعة [افتراض-SD]
+كل شيء مكتوب كـ:
+[افتراض-SD] 
+يجب تصنيفه:
+• Confirmed
+• Pending
+• Rejected
+• Converted to Decision
+حتى لا تبقى افتراضات داخل التصميم النهائي.
+6. تثبيت Ownership للـCache
+يجب توثيق:
+• من يكتب كل key
+• من يقرأه
+• هل هو module-private أم common
+• من يستطيع invalidation
+• naming convention
+مع تثبيت:
+common 
+للبيانات المشتركة فقط.
+7. مراجعة FKs وIndexes
+خصوصًا في:
+• EXM
+• PRC
+• ATT
+• PostgreSQL hot tables
+والتركيز على queries المستخدمة أثناء الامتحان.
+8. Security Threat Model
+يجب إضافة Threat Model يغطي:
+• Tenant breakout
+• IDOR
+• Replay attacks
+• Duplicate submissions
+• Device binding bypass
+• Rooted devices
+• Privilege escalation
+• Redis access
+• Internal API abuse
+• Event spoofing
+19. P2 — تحسينات مهمة
+9. Observability Matrix
+ربط:
+Business metric + Technical metric + Alert 
+مثلًا:
+Exam submission failure rate API latency PostgreSQL latency Rust worker latency Redis memory RAM usage CPU usage Queue depth 
+10. Load Testing
+هذه أهم نقطة لإثبات الأرقام السابقة.
+يجب عمل Tests على الأقل لـ:
+500 students 1,000 students 1,500 students 2,000 students 
+مع سيناريو:
+• Start burst
+• Answer save كل 15 ثانية
+• PRC events
+• Submission burst
+• Exam end
+• Auto-submit
+• Background events
+وتسجيل:
+RAM CPU P95 latency P99 latency Requests/sec DB connections DB query latency Redis memory Queue depth Error rate 
+20. مشاكل أخرى ظهرت في مراجعة الوثيقة
+يجب أيضًا حسم/مراجعة:
+R-01
+Single-server SPOF مقابل هدف availability 99.9% أثناء الامتحانات.
+R-03
+التناقض بين:
+FR-SET-011 
+وقرار حذف notifications.
+R-04
+قرار:
+MinIO → Garage 
+والتأكد من اتساق جميع أجزاء الوثيقة معه.
+R-05
+AI Provider خارج السودان مقابل:
+NFR-HOST-001 
+والتأكد من توافق القرار مع متطلبات الاستضافة والبيانات.
+R-06
+FCM يمر عبر Google، مع التأكد أن payload لا يحتوي بيانات حساسة، والوثيقة تشير إلى payload مثل:
+{type, id} 
+R-07
+Memory constraint، وهي النقطة التي تمت مناقشتها بالتفصيل أعلاه.
+R-09
+Device binding لا يمنع bypass بشكل كامل على rooted devices.
+R-10
+RLS يحتاج automated tenant-isolation tests شاملة.
+R-11
+يجب التأكد من قاعدة إمكانية وجود نفس email في أكثر من University/Tenant.
+21. القرار الحالي للـExam Architecture
+حتى هذه اللحظة، القرار الأكثر وضوحًا هو:
+Exam System │ ┌──────────┴──────────┐ │ │ EXM PRC Rust Hot Path Rust Hot Path │ │ └──────────┬──────────┘ │ PostgreSQL │ باقي الـModules NestJS/TS 
+والهدف ليس استخدام Rust في أكبر عدد من الوحدات، وإنما:
+استخدام Rust فقط حيث يوجد أعلى concurrency وأعلى ضغط أثناء الامتحان.
+وهذا يجعل القرار هندسيًا بدل أن يكون مجرد اختيار تقني.
+الخلاصة النهائية
+الـSSD في وضعه الحالي قوي جدًا، وتقييمه التقريبي:
+8.9/10
+ولا يحتاج إعادة بناء.
+أهم ما يحتاجه الآن هو:
+• إزالة التناقضات.
+• تثبيت ownership والقواعد.
+• ربط BRD بالـSSD بشكل traceable.
+• تأكيد Tenant Isolation.
+• تثبيت Cache Isolation.
+• تثبيت EXM + PRC كـRust hot paths.
+• تحسين PostgreSQL والـconnection management.
+• ضبط Redis وBullMQ.
+• عمل Threat Model.
+• عمل Load Test حقيقي حتى 2,000 طالب.
+والنقطة الأهم:
+بعد نقل EXM وPRC إلى Rust، لا ينبغي أن يكون التركيز التالي على نقل المزيد من الوحدات إلى Rust. التركيز يجب أن ينتقل إلى جودة التنفيذ، PostgreSQL، concurrency control، memory management، والـload testing.
+لأن إثبات أن النظام يتحمل 2,000 طالب فعليًا لن يأتي من لغة البرمجة وحدها؛ سيأتي من القياس تحت الحمل الحقيقي.
