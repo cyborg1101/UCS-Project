@@ -1,0 +1,45 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "exactOptionalPropertyTypes": false,
+    "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "forceConsistentCasingInFileNames": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "declaration": false,
+    "sourceMap": true,
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true,
+    "baseUrl": ".",
+    "types": ["node"],
+    "paths": {
+      "@ucs/shared": ["libs/shared/src/index.ts"],
+      "@ucs/shared/*": ["libs/shared/src/*"],
+      "@ucs/kernel": ["libs/kernel/src/index.ts"],
+      "@ucs/kernel/*": ["libs/kernel/src/*"],
+      "@ucs/platform-audit": ["libs/platform/audit/src/index.ts"],
+      "@ucs/platform-messaging": ["libs/platform/messaging/src/index.ts"],
+      "@ucs/platform-files": ["libs/platform/files/src/index.ts"],
+      "@ucs/module-sample": ["libs/modules/sample/src/index.ts"],
+      "@ucs/module-sample/*": ["libs/modules/sample/src/*"]
+    }
+  },
+  "include": [
+    "apps/**/*.ts",
+    "libs/**/*.ts",
+    "tools/**/*.ts",
+    "tests/**/*.ts",
+    "vitest.config.ts"
+  ],
+  "exclude": ["node_modules", "dist", "**/generated/**"]
+}

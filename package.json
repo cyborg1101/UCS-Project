@@ -1,0 +1,67 @@
+{
+  "name": "ums",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Integrated University Management System - Phase 0 Kernel",
+  "workspaces": [
+    "apps/*",
+    "libs/*",
+    "libs/platform/*",
+    "libs/modules/*",
+    "tools"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "test:unit": "vitest run --project unit",
+    "test:integration": "vitest run --project integration",
+    "db:roles": "tsx tools/db/migrate.ts --bootstrap-only",
+    "db:migrate": "tsx tools/db/migrate.ts",
+    "db:template": "tsx tools/db/migrate.ts --template",
+    "db:reset": "tsx tools/db/migrate.ts --reset --template",
+    "check:boundaries": "depcruise --config .dependency-cruiser.cjs apps libs tools",
+    "check:grants": "tsx tools/ci/check-grants.ts",
+    "check:rls": "tsx tools/ci/check-rls.ts",
+    "check:indexes": "tsx tools/ci/check-indexes.ts",
+    "check:pools": "tsx tools/ci/check-pools.ts",
+    "check:money": "eslint --rulesdir tools/eslint-rules libs --ext .ts",
+    "check:traceability": "tsx tools/ci/check-traceability.ts",
+    "check:dev-auth": "tsx tools/ci/check-dev-auth.ts",
+    "check:contracts": "tsx tools/ci/check-contracts.ts",
+    "check": "npm run typecheck && npm run lint && npm run check:boundaries && npm run test",
+    "g:module": "tsx tools/generators/module/generate.ts",
+    "demo:phase0": "tsx tools/demo/phase0.ts",
+    "api": "tsx apps/api/src/main.ts",
+    "worker": "tsx apps/worker/src/main.ts"
+  },
+  "dependencies": {
+    "@nestjs/common": "^11.0.0",
+    "@nestjs/core": "^11.0.0",
+    "@nestjs/platform-express": "^11.1.6",
+    "decimal.js": "^10.4.3",
+    "kysely": "^0.27.4",
+    "nestjs-cls": "^7.0.2",
+    "pg": "^8.13.1",
+    "pino": "^9.5.0",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.1",
+    "ulid": "^2.3.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.10.2",
+    "@types/pg": "^8.11.10",
+    "dependency-cruiser": "^16.4.2",
+    "eslint": "^8.57.1",
+    "@typescript-eslint/eslint-plugin": "^8.18.0",
+    "@typescript-eslint/parser": "^8.18.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

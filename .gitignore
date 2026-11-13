@@ -1,0 +1,31 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+*.tsbuildinfo
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Runtime
+logs/
+*.log
+pids/
+*.pid
+
+# Test / coverage
+coverage/
+.vitest/
+
+# DB local state
+.wrangler/
+pgdata/
+
+# Backup
+*.tar.gz
+*.zip
+*.bak
