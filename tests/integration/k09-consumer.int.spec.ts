@@ -257,7 +257,12 @@ describe('[K09-T02] G4: المعالجة والـinbox والـoffset في مع�
     expect(outcome.kind).toBe('processed');
     if (outcome.kind === 'processed') {
       expect(outcome.handled).toBe(0);
-      expect(outcome.deadLettered).toBeGreaterThanOrEqual(1);
+      // The plan's contract for a failing handler is that the effect, the inbox
+      // row and the cursor all stay as they were. With the default maxAttempts
+      // the first failure is a RETRY, not an exhaustion, so nothing may be
+      // dead-lettered yet — an event only becomes final at maxAttempts, which
+      // is what K09-T09 exercises explicitly.
+      expect(outcome.deadLettered).toBe(0);
     }
 
     // Nothing was applied, and the cursor did not move past the failed event.
@@ -563,11 +568,20 @@ describe('[K09-T12] المستهلك يكتب بنتيجة سياق الحدث �
     ]);
     await consumer.pollOnce();
 
-    const rows = await queryInDatabase<{ tenant_id: string }>(
-      db.name,
-      `SELECT tenant_id FROM sample.consumer_result WHERE consumer = $1 ORDER BY tenant_id`,
-      [name],
-    );
-    expect(rows.map((r) => r.tenant_id).sort()).toEqual([TENANT_A, TENANT_B].sort());
+    // Read per tenant, not through the migrator: consumer_result is FORCE-RLS
+    // and its policy admits no operational role, so a tenant-less read returns
+    // zero rows and the assertion would pass for the wrong reason. Seeing each
+    // row only under its own tenant is exactly the property under test.
+    const found: string[] = [];
+    for (const tenantId of [TENANT_A, TENANT_B]) {
+      const r = await inTenantTx(app, { tenantId }, async () =>
+        app.query<{ tenant_id: string }>(
+          `SELECT tenant_id FROM sample.consumer_result WHERE consumer = $1`,
+          [name],
+        ),
+      );
+      found.push(...r.rows.map((x) => x.tenant_id));
+    }
+    expect(found.sort()).toEqual([TENANT_A, TENANT_B].sort());
   });
 });

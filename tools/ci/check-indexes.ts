@@ -23,6 +23,11 @@ export const INDEX_EXEMPTIONS: Array<{ schema: string; table: string; index: str
   { schema: 'sample', table: 'offset', index: 'offset_pkey', reason: 'one row per consumer' },
   { schema: 'sample', table: 'dead_letter', index: 'dlq_unique', reason: 'consumer+event dedup' },
   { schema: 'sample', table: 'idempotency_key', index: 'idempotency_key_pkey', reason: 'tenant-first but includes user+key' },
+  // Consumer-side lookups are cross-tenant by design: the consumer process
+  // resolves an aggregate's parked followers before any tenant is known, so
+  // the leading column must be consumer. Tenant-filtered listing still has
+  // parked_event_tenant_idx (tenant_id, parked_at).
+  { schema: 'sample', table: 'parked_event', index: 'parked_event_agg_idx', reason: 'cross-tenant consumer lookup; tenant-leading index exists separately' },
 ];
 
 function exempt(schema: string, table: string, index: string): boolean {

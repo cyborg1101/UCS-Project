@@ -469,6 +469,26 @@ AS $$
                   WHERE consumer = p_consumer AND event_id = p_event_id)
 $$;
 
+-- An event that has EXHAUSTED its attempts (or that an operator explicitly
+-- skipped) and is therefore finished until someone acts on it. A mere failed
+-- attempt is not enough: dead_letter holds a row from the very first failure
+-- with attempts = 1, and treating that as final would stop the retries the
+-- backoff contract promises. Hence the threshold, and the skipped_reason
+-- escape hatch (dlq_skip means "do not run this again").
+CREATE OR REPLACE FUNCTION sample.consumer_is_dead(
+  p_consumer text, p_event_id uuid, p_max_attempts int
+)
+RETURNS boolean
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = sample, public
+AS $$
+  SELECT EXISTS (SELECT 1 FROM sample.dead_letter
+                  WHERE consumer = p_consumer
+                    AND event_id = p_event_id
+                    AND (attempts >= p_max_attempts OR skipped_reason IS NOT NULL))
+$$;
+
 -- Followers of an aggregate that just had its hole filled: returns the earliest
 -- log_seq among them and removes them, so the caller can rewind once.
 CREATE OR REPLACE FUNCTION sample.consumer_release_followers(
@@ -578,6 +598,7 @@ ALTER FUNCTION sample.consumer_seen(text, uuid)                   OWNER TO consu
 ALTER FUNCTION sample.consumer_record(text, uuid, uuid, uuid, bigint, bigint) OWNER TO consumer_reader;
 ALTER FUNCTION sample.consumer_park(text, uuid, uuid, uuid, bigint, bigint, bigint) OWNER TO consumer_reader;
 ALTER FUNCTION sample.consumer_is_parked(text, uuid)              OWNER TO consumer_reader;
+ALTER FUNCTION sample.consumer_is_dead(text, uuid, int)           OWNER TO consumer_reader;
 ALTER FUNCTION sample.consumer_release_followers(text, uuid, bigint) OWNER TO consumer_reader;
 ALTER FUNCTION sample.consumer_dead_letter(text, uuid, uuid, uuid, bigint, jsonb, text, bigint) OWNER TO consumer_reader;
 ALTER FUNCTION sample.parked_for_consumer(text)                   OWNER TO consumer_reader;
@@ -597,6 +618,7 @@ GRANT EXECUTE ON FUNCTION
   sample.consumer_record(text, uuid, uuid, uuid, bigint, bigint),
   sample.consumer_park(text, uuid, uuid, uuid, bigint, bigint, bigint),
   sample.consumer_is_parked(text, uuid),
+  sample.consumer_is_dead(text, uuid, int),
   sample.consumer_release_followers(text, uuid, bigint),
   sample.consumer_dead_letter(text, uuid, uuid, uuid, bigint, jsonb, text, bigint),
   sample.parked_for_consumer(text),
@@ -609,7 +631,13 @@ GRANT EXECUTE ON FUNCTION
 -- through - and nothing else.
 ALTER FUNCTION sample.outbox_fetch(int)            OWNER TO relay_reader;
 ALTER FUNCTION sample.outbox_ack(uuid[])           OWNER TO relay_reader;
-ALTER FUNCTION sample.dlq_replay_aggregate(text, uuid) OWNER TO consumer_reader;
+-- Owned by migrator, like dlq_skip: it mutates consumer state AND appends to
+-- the audit chain in the same transaction. migrator is a member of
+-- consumer_reader (so the RLS policies admit its consumer-table writes) and
+-- holds USAGE on audit (so the attribution cannot be silently dropped);
+-- consumer_reader alone would fail at the audit write and roll back the
+-- replay. consumer_reader is NOLOGIN, so nothing gains a login path here.
+ALTER FUNCTION sample.dlq_replay_aggregate(text, uuid) OWNER TO migrator;
 GRANT SELECT, INSERT, UPDATE, DELETE ON sample.outbox TO relay_reader;
 GRANT SELECT, UPDATE ON sample.dead_letter TO relay_reader;
 

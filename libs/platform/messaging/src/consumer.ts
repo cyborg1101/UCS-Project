@@ -1,4 +1,4 @@
-import { Pool, type PoolClient } from 'pg';
+import { Client } from 'pg';
 import type { Logger } from '@ucs/shared';
 import { TIMEOUTS } from '@ucs/kernel';
 
@@ -19,6 +19,19 @@ import { TIMEOUTS } from '@ucs/kernel';
  *          than an in-process counter nothing can alert on.
  *  - E-11: a persistently failing event moves to dead_letter, parking only its
  *          aggregate; dlq_replay_aggregate() rewinds the cursor after the fix.
+ *
+ * ## Why one long-lived connection, not a pool
+ *
+ * The E-08 lock is *session* scoped: it lives and dies with the backend that
+ * took it. A pool hands a different borrower to each statement sequence, so the
+ * lock would either be taken on a connection we then give away (releasing it
+ * invisibly) or re-entered on a connection we already hold (the counter grows
+ * and one unlock can never clear it). Owning exactly one connection for this
+ * consumer's lifetime makes the lock's scope identical to the object's scope,
+ * and removes the whole class of "released twice" / "released by someone else"
+ * bugs by construction: nothing here ever releases a connection back to a pool,
+ * because there is no pool. `close()` closes the socket, and PostgreSQL drops
+ * every session-level lock with it.
  *
  * Consumer state is cross-tenant by nature (a cursor spans every tenant's
  * events), and it must be read before an event — and therefore a tenant — is
@@ -139,14 +152,19 @@ export interface ParkedAggregate {
 }
 
 export class Consumer {
-  readonly #pool: Pool;
+  readonly #client: Client;
   readonly #config: Required<Omit<ConsumerConfig, 'connectionString' | 'logger'>> & {
     connectionString: string;
     logger?: Logger;
   };
   readonly #handler: ConsumerHandler;
+  #connected = false;
+  #closed = false;
   #stopped = false;
-  #lockClient: PoolClient | null = null;
+  /** Truth of "this session currently holds the advisory lock" — never inferred
+   *  from which object we happened to be handed. */
+  #lockHeld = false;
+  #polling = false;
 
   constructor(config: ConsumerConfig, handler: ConsumerHandler) {
     this.#config = {
@@ -157,76 +175,80 @@ export class Consumer {
       ...config,
     };
     this.#handler = handler;
-    // max 1: the advisory lock is session-scoped, so it must live on a
-    // connection this process owns for its whole lifetime.
-    this.#pool = new Pool({
+    this.#client = new Client({
       connectionString: config.connectionString,
-      max: 1,
       application_name: `ums-consumer-${config.name}`,
     });
   }
 
   async close(): Promise<void> {
-    if (this.#lockClient) {
-      const held = this.#lockClient;
-      // Clear the field first: the client is about to be released, and close()
-      // being called twice (or re-entrantly) must not double-release, which pg
-      // throws on.
-      this.#lockClient = null;
-      await held
-        .query(`SELECT pg_advisory_unlock(hashtextextended($1, 0))`, [this.#lockKey()])
-        .catch(() => undefined);
-      held.release();
-    }
-    await this.#pool.end();
+    if (this.#closed) return;
+    this.#closed = true;
+    if (!this.#connected) return;
+    await this.#unlock();
+    // end() closes the socket; PostgreSQL drops every session-level lock with
+    // the backend, so there is nothing left to release and nothing that can be
+    // released twice.
+    await this.#client.end().catch(() => undefined);
   }
 
   stop(): void {
+    // Cooperative shutdown: the loop exits after the batch in flight. A lock is
+    // per batch here, so there is no long-lived lease to wait for.
     this.#stopped = true;
   }
 
   /** Register this consumer's subscriptions (idempotent). */
   async subscribe(): Promise<void> {
-    const c = await this.#pool.connect();
-    try {
-      for (const type of this.#config.subscriptions) {
-        await c.query(`SELECT messaging.subscribe($1, $2)`, [this.#config.name, type]);
-      }
-      const head = await c.query<{ max_log_seq: string }>(
-        `SELECT messaging.max_log_seq()::text AS max_log_seq`,
-      );
-      await c.query(`SELECT ${this.#config.schema}.consumer_ensure($1, $2)`, [
+    await this.#ensureConnected();
+    for (const type of this.#config.subscriptions) {
+      await this.#client.query(`SELECT messaging.subscribe($1, $2)`, [
         this.#config.name,
-        Number(head.rows[0]?.max_log_seq ?? 0),
+        type,
       ]);
-    } finally {
-      c.release();
     }
+    const head = await this.#client.query<{ max_log_seq: string }>(
+      `SELECT messaging.max_log_seq()::text AS max_log_seq`,
+    );
+    // Subscribe at head: a consumer that starts today must not replay the whole
+    // history of its event types, which would re-apply months of state.
+    await this.#client.query(`SELECT ${this.#config.schema}.consumer_ensure($1, $2)`, [
+      this.#config.name,
+      Number(head.rows[0]?.max_log_seq ?? 0),
+    ]);
   }
 
   /** One batch. Public so tests drive it deterministically. */
   async pollOnce(): Promise<BatchOutcome> {
-    const client = await this.#pool.connect();
+    if (this.#closed) throw new Error('consumer is closed');
+    if (this.#polling) {
+      // The batch owns an explicit transaction and a session lock; running two
+      // at once on one connection would interleave them. Callers that need
+      // concurrency create another Consumer (E-08 covers that case).
+      throw new Error(`consumer '${this.#config.name}' already has a batch in flight`);
+    }
+    this.#polling = true;
     try {
-      const headRes = await client.query<{ max_log_seq: string }>(
+      await this.#ensureConnected();
+
+      // E-08: the lock spans the whole batch, not one statement.
+      if (!(await this.#tryLock())) return { kind: 'lost-lock' };
+
+      const headRes = await this.#client.query<{ max_log_seq: string }>(
         `SELECT messaging.max_log_seq()::text AS max_log_seq`,
       );
-      const offsetFallback = Number(headRes.rows[0]?.max_log_seq ?? 0);
-      // E-08: hold the subscription for the whole batch.
-      if (!(await this.#acquireLock(client))) return { kind: 'lost-lock' };
-
-      await client.query(`SELECT ${this.#config.schema}.consumer_ensure($1, $2)`, [
+      await this.#client.query(`SELECT ${this.#config.schema}.consumer_ensure($1, $2)`, [
         this.#config.name,
-        offsetFallback,
+        Number(headRes.rows[0]?.max_log_seq ?? 0),
       ]);
 
-      const offsetRes = await client.query<{ consumer_offset: string }>(
+      const offsetRes = await this.#client.query<{ consumer_offset: string }>(
         `SELECT ${this.#config.schema}.consumer_offset($1) AS consumer_offset`,
         [this.#config.name],
       );
       const offset = Number(offsetRes.rows[0]?.consumer_offset ?? 0);
 
-      const events = await client.query<LogRow>(
+      const events = await this.#client.query<LogRow>(
         `SELECT * FROM messaging.read_subscribed($1, $2, $3)`,
         [this.#config.name, offset, this.#config.batchSize],
       );
@@ -236,8 +258,8 @@ export class Consumer {
       let parked = 0;
       let deadLettered = 0;
       /**
-       * Earliest log_seq that must be attempted again (K09-T02 partial failure,
-       * E-11). Later events may legitimately be handled — a poison event parks
+       * Earliest log_seq that must be attempted again (K09-T02 partial failure).
+       * Later events may legitimately be handled — a poison event holds back
        * only its own aggregate — but the cursor must never move past the
        * failure, because the cursor only moves forward and the retry would
        * otherwise never happen.
@@ -247,14 +269,22 @@ export class Consumer {
       for (const row of events.rows) {
         const event = toEvent(row);
 
-        if (await this.#isParked(client, event)) {
+        if (await this.#isParked(event)) {
           parked += 1;
           continue;
         }
 
-        const state = await this.#aggregateState(client, event);
+        // An event that already exhausted its attempts is finished: it waits for
+        // an operator (dlq_replay_aggregate / dlq_skip). Re-running the handler
+        // on every rewind would just burn attempts and repeat side effects.
+        if (await this.#isDeadLettered(event)) {
+          await this.#advance(event.logSeq);
+          continue;
+        }
+
+        const state = await this.#aggregateState(event);
         if (state.kind === 'gap') {
-          await this.#park(client, event, state.expected);
+          await this.#park(event, state.expected);
           parked += 1;
           // Everything after a gap must wait: advancing past it would apply a
           // later state on top of a missing one.
@@ -263,23 +293,20 @@ export class Consumer {
         if (state.kind === 'duplicate') {
           // K09-T06: a repeated or older sequence is already applied. Move the
           // cursor past it, but never run the handler a second time.
-          await client.query(`SELECT ${this.#config.schema}.consumer_advance($1, $2)`, [
-            this.#config.name,
-            event.logSeq,
-          ]);
+          await this.#advance(event.logSeq);
           handled += 1;
           continue;
         }
 
-        const result = await this.#handleOne(client, event);
+        const result = await this.#handleOne(event);
         if (result === 'ok' || result === 'duplicate') {
           handled += 1;
         } else if (result === 'dead') {
           deadLettered += 1;
-        } else {
+        } else if (blockedAt === null || event.logSeq < blockedAt) {
           // Not exhausted yet: remember the position and keep draining, so one
           // poison event cannot stall every other tenant's events.
-          if (blockedAt === null || event.logSeq < blockedAt) blockedAt = event.logSeq;
+          blockedAt = event.logSeq;
         }
       }
 
@@ -287,7 +314,7 @@ export class Consumer {
         // Hand the failed position back to the next poll. Effects already
         // applied in this batch stay applied; the inbox key makes their replay
         // a no-op, so rewinding costs nothing.
-        await client.query(`SELECT ${this.#config.schema}.consumer_rewind($1, $2)`, [
+        await this.#client.query(`SELECT ${this.#config.schema}.consumer_rewind($1, $2)`, [
           this.#config.name,
           blockedAt - 1,
         ]);
@@ -295,7 +322,10 @@ export class Consumer {
 
       return { kind: 'processed', handled, parked, deadLettered };
     } finally {
-      client.release();
+      // The lock is per batch, so it is always given back here — on the very
+      // session that took it.
+      await this.#unlock();
+      this.#polling = false;
     }
   }
 
@@ -318,47 +348,62 @@ export class Consumer {
   }
 
   async parkedAggregates(): Promise<ParkedAggregate[]> {
-    const client = await this.#pool.connect();
-    try {
-      const res = await client.query<{
-        consumer: string;
-        aggregate_id: string;
-        aggregate_seq: string;
-        expected_seq: string;
-        parked_at: Date;
-        age_seconds: string;
-      }>(`SELECT * FROM ${this.#config.schema}.parked_for_consumer($1)`, [this.#config.name]);
-      return res.rows.map((r) => ({
-        consumer: r.consumer,
-        aggregateId: r.aggregate_id,
-        aggregateSeq: Number(r.aggregate_seq),
-        expectedSeq: Number(r.expected_seq),
-        parkedAt: r.parked_at,
-        ageSeconds: Number(r.age_seconds),
-      }));
-    } finally {
-      client.release();
-    }
+    await this.#ensureConnected();
+    const res = await this.#client.query<{
+      consumer: string;
+      aggregate_id: string;
+      aggregate_seq: string;
+      expected_seq: string;
+      parked_at: Date;
+      age_seconds: string;
+    }>(`SELECT * FROM ${this.#config.schema}.parked_for_consumer($1)`, [this.#config.name]);
+    return res.rows.map((r) => ({
+      consumer: r.consumer,
+      aggregateId: r.aggregate_id,
+      aggregateSeq: Number(r.aggregate_seq),
+      expectedSeq: Number(r.expected_seq),
+      parkedAt: r.parked_at,
+      ageSeconds: Number(r.age_seconds),
+    }));
+  }
+
+  async #ensureConnected(): Promise<void> {
+    if (this.#closed) throw new Error('consumer is closed');
+    if (this.#connected) return;
+    await this.#client.connect();
+    this.#connected = true;
   }
 
   #lockKey(): string {
     return `${this.#config.schema}.consumer.${this.#config.name}`;
   }
 
-  async #acquireLock(client: PoolClient): Promise<boolean> {
-    // Advisory locks are re-entrant per session: calling pg_try_advisory_lock
-    // again on the same connection increments a counter, so a single unlock in
-    // close() would never release it and every other replica would block
-    // forever. Re-acquiring on a connection that already holds it is a bug.
-    if (this.#lockClient === client) return true;
-
-    const res = await client.query<{ locked: boolean }>(
+  async #tryLock(): Promise<boolean> {
+    // Advisory locks are re-entrant per session: a second pg_try_advisory_lock on
+    // the same backend increments a counter that a single unlock cannot clear.
+    // The flag is the guard, so the lock is taken exactly once per batch.
+    if (this.#lockHeld) return true;
+    const res = await this.#client.query<{ locked: boolean }>(
       `SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked`,
       [this.#lockKey()],
     );
-    const locked = res.rows[0]?.locked ?? false;
-    if (locked) this.#lockClient = client;
-    return locked;
+    this.#lockHeld = res.rows[0]?.locked ?? false;
+    return this.#lockHeld;
+  }
+
+  async #unlock(): Promise<void> {
+    if (!this.#lockHeld || !this.#connected) return;
+    this.#lockHeld = false;
+    await this.#client
+      .query(`SELECT pg_advisory_unlock(hashtextextended($1, 0))`, [this.#lockKey()])
+      .catch(() => undefined);
+  }
+
+  async #advance(logSeq: number): Promise<void> {
+    await this.#client.query(`SELECT ${this.#config.schema}.consumer_advance($1, $2)`, [
+      this.#config.name,
+      logSeq,
+    ]);
   }
 
   /**
@@ -372,11 +417,10 @@ export class Consumer {
    * 'gap' into 'ok' would apply a later state on top of a missing one.
    */
   async #aggregateState(
-    client: PoolClient,
     event: ConsumedEvent,
   ): Promise<{ kind: 'ok' | 'duplicate' } | { kind: 'gap'; expected: number }> {
     if (!event.aggregateId || event.aggregateSeq === null) return { kind: 'ok' };
-    const r = await client.query<{ consumer_applied_seq: string | null }>(
+    const r = await this.#client.query<{ consumer_applied_seq: string | null }>(
       `SELECT ${this.#config.schema}.consumer_applied_seq($1, $2) AS consumer_applied_seq`,
       [this.#config.name, event.aggregateId],
     );
@@ -387,16 +431,24 @@ export class Consumer {
     return { kind: 'ok' };
   }
 
-  async #isParked(client: PoolClient, event: ConsumedEvent): Promise<boolean> {
-    const r = await client.query<{ consumer_is_parked: boolean }>(
+  async #isParked(event: ConsumedEvent): Promise<boolean> {
+    const r = await this.#client.query<{ consumer_is_parked: boolean }>(
       `SELECT ${this.#config.schema}.consumer_is_parked($1, $2) AS consumer_is_parked`,
       [this.#config.name, event.eventId],
     );
     return r.rows[0]?.consumer_is_parked ?? false;
   }
 
-  async #park(client: PoolClient, event: ConsumedEvent, expected: number): Promise<void> {
-    await client.query(
+  async #isDeadLettered(event: ConsumedEvent): Promise<boolean> {
+    const r = await this.#client.query<{ consumer_is_dead: boolean }>(
+      `SELECT ${this.#config.schema}.consumer_is_dead($1, $2, $3) AS consumer_is_dead`,
+      [this.#config.name, event.eventId, this.#config.maxAttempts],
+    );
+    return r.rows[0]?.consumer_is_dead ?? false;
+  }
+
+  async #park(event: ConsumedEvent, expected: number): Promise<void> {
+    await this.#client.query(
       `SELECT ${this.#config.schema}.consumer_park($1,$2,$3,$4,$5,$6,$7)`,
       [
         this.#config.name,
@@ -410,35 +462,32 @@ export class Consumer {
     );
   }
 
-  async #handleOne(
-    client: PoolClient,
-    event: ConsumedEvent,
-  ): Promise<'ok' | 'duplicate' | 'dead' | 'retry'> {
+  async #handleOne(event: ConsumedEvent): Promise<'ok' | 'duplicate' | 'dead' | 'retry'> {
     const t = TIMEOUTS.background;
     // G4 / E-07: handler effects + inbox + cursor advance in a single tx.
-    await client.query('BEGIN');
+    await this.#client.query('BEGIN');
+    let inTx = true;
     try {
-      await client.query(`SELECT set_config('app.tenant_id', $1, true)`, [event.tenantId]);
-      await client.query(`SELECT set_config('app.correlation_id', $1, true)`, [
+      await this.#client.query(`SELECT set_config('app.tenant_id', $1, true)`, [event.tenantId]);
+      await this.#client.query(`SELECT set_config('app.correlation_id', $1, true)`, [
         event.correlationId ?? '',
       ]);
-      await client.query(`SET LOCAL statement_timeout = ${Number(t.statementTimeoutMs)}`);
-      await client.query(`SET LOCAL lock_timeout = ${Number(t.lockTimeoutMs)}`);
+      await this.#client.query(`SET LOCAL statement_timeout = ${Number(t.statementTimeoutMs)}`);
+      await this.#client.query(`SET LOCAL lock_timeout = ${Number(t.lockTimeoutMs)}`);
 
-      const seen = await client.query<{ consumer_seen: boolean }>(
+      const seen = await this.#client.query<{ consumer_seen: boolean }>(
         `SELECT ${this.#config.schema}.consumer_seen($1, $2) AS consumer_seen`,
         [this.#config.name, event.eventId],
       );
       if (seen.rows[0]?.consumer_seen) {
         // Idempotent replay: advance the cursor, do not re-run the handler.
-        await client.query(`SELECT ${this.#config.schema}.consumer_advance($1, $2)`, [
-          this.#config.name,
-          event.logSeq,
-        ]);
-        await client.query('COMMIT');
+        await this.#advance(event.logSeq);
+        await this.#client.query('COMMIT');
+        inTx = false;
         return 'duplicate';
       }
 
+      const client = this.#client;
       const tx: ConsumerTx = {
         async query<T extends Record<string, unknown>>(sql: string, params: unknown[] = []) {
           const res = await client.query(sql, params);
@@ -452,50 +501,50 @@ export class Consumer {
 
       await this.#handler(event, tx);
 
-      await client.query(`SELECT ${this.#config.schema}.consumer_record($1,$2,$3,$4,$5,$6)`, [
-        this.#config.name,
-        event.eventId,
-        event.tenantId,
-        event.aggregateId,
-        event.aggregateSeq,
-        event.logSeq,
-      ]);
+      await this.#client.query(
+        `SELECT ${this.#config.schema}.consumer_record($1,$2,$3,$4,$5,$6)`,
+        [
+          this.#config.name,
+          event.eventId,
+          event.tenantId,
+          event.aggregateId,
+          event.aggregateSeq,
+          event.logSeq,
+        ],
+      );
 
       // A gap filled by this event unblocks the aggregate's followers.
       if (event.aggregateId && event.aggregateSeq !== null) {
-        const rel = await client.query<{ consumer_release_followers: string | null }>(
+        const rel = await this.#client.query<{ consumer_release_followers: string | null }>(
           `SELECT ${this.#config.schema}.consumer_release_followers($1,$2,$3) AS consumer_release_followers`,
           [this.#config.name, event.aggregateId, event.aggregateSeq],
         );
         const earliest = rel.rows[0]?.consumer_release_followers;
         if (earliest !== null && earliest !== undefined) {
           // Rewind so the followers are re-read, in order, on the next poll.
-          await client.query(`SELECT ${this.#config.schema}.consumer_rewind($1, $2)`, [
+          await this.#client.query(`SELECT ${this.#config.schema}.consumer_rewind($1, $2)`, [
             this.#config.name,
             Number(earliest) - 1,
           ]);
         }
       }
 
-      await client.query('COMMIT');
+      await this.#client.query('COMMIT');
+      inTx = false;
       return 'ok';
     } catch (err) {
-      await client.query('ROLLBACK').catch(() => undefined);
-      const exhausted = await this.#deadLetter(client, event, err as Error);
+      if (inTx) await this.#client.query('ROLLBACK').catch(() => undefined);
+      const exhausted = await this.#deadLetter(event, err as Error);
       // Only an exhausted event may be skipped past; anything else must be
       // retried at the same position.
       return exhausted ? 'dead' : 'retry';
     }
   }
 
-  /** E-11: after maxAttempts the event goes to dead_letter, parking its aggregate. */
-  async #deadLetter(
-    client: PoolClient,
-    event: ConsumedEvent,
-    err: Error,
-  ): Promise<boolean> {
+  /** E-11: after maxAttempts the event goes to dead_letter, holding back only its aggregate. */
+  async #deadLetter(event: ConsumedEvent, err: Error): Promise<boolean> {
     try {
-      const res = await client.query<{ consumer_dead_letter: number }>(
+      const res = await this.#client.query<{ consumer_dead_letter: number }>(
         `SELECT ${this.#config.schema}.consumer_dead_letter($1,$2,$3,$4,$5,$6::jsonb,$7,$8) AS consumer_dead_letter`,
         [
           this.#config.name,
@@ -510,12 +559,10 @@ export class Consumer {
       );
       const attempts = Number(res.rows[0]?.consumer_dead_letter ?? 0);
       if (attempts >= this.#config.maxAttempts) {
-        // Only this aggregate is parked; advance past this event so the rest of
-        // the log keeps flowing.
-        await client.query(`SELECT ${this.#config.schema}.consumer_advance($1, $2)`, [
-          this.#config.name,
-          event.logSeq,
-        ]);
+        // Only this aggregate is held back; advance past this event so the rest
+        // of the log keeps flowing. Followers of the same aggregate then park on
+        // their own forward gap, which is what makes the stall observable.
+        await this.#advance(event.logSeq);
         return true;
       }
       return false;
