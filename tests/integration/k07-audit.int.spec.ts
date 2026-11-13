@@ -8,7 +8,7 @@ import {
   connectAs,
   createTestDatabase,
   expectFailure,
-  inTenantTx,
+
   TENANT_A,
   TENANT_B,
 } from '../../tools/db/test-db';

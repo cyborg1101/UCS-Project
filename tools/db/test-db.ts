@@ -8,6 +8,7 @@
  */
 import { Client } from 'pg';
 import { randomBytes } from 'node:crypto';
+import { buildContext, contextStore, type Executor } from '@ucs/kernel';
 
 export const HOST = process.env.PGHOST ?? '127.0.0.1';
 export const PORT = process.env.PGPORT ?? '5432';
@@ -120,12 +121,31 @@ export interface TxOptions {
 /**
  * Minimal withTenantTx for raw integration tests: mirrors the production
  * implementation in libs/kernel/db (SET LOCAL only, never session SET).
+ *
+ * It also binds the request context in AsyncLocalStorage, exactly as the real
+ * HTTP/worker entry points do. Without it, code that legitimately reads the
+ * context (outbox correlation ids, audit actor, P-05 transaction marker) would
+ * behave differently under test than in production — the harness must not
+ * change the semantics it is meant to verify.
  */
 export async function inTenantTx<T>(
   client: Client,
   opts: TxOptions,
   fn: () => Promise<T>,
 ): Promise<T> {
+  if (contextStore.tryGet()) {
+    return runInTx(client, opts, fn);
+  }
+  const ctx = buildContext({
+    tenantId: opts.tenantId ?? null,
+    userId: opts.userId ?? null,
+    correlationId: opts.correlationId ?? undefined,
+    client: 'test',
+  });
+  return contextStore.run(ctx, () => runInTx(client, opts, fn));
+}
+
+async function runInTx<T>(client: Client, opts: TxOptions, fn: () => Promise<T>): Promise<T> {
   await client.query('BEGIN');
   try {
     await client.query(`SELECT set_config('app.tenant_id', $1, true)`, [opts.tenantId ?? '']);
@@ -142,5 +162,45 @@ export async function inTenantTx<T>(
   } catch (err) {
     await client.query('ROLLBACK').catch(() => undefined);
     throw err;
+  }
+}
+
+/**
+ * Real `Executor` over a live client — the same three-method surface the kernel
+ * hands to module code, so tests exercise the production contract rather than a
+ * hand-rolled stub that can silently diverge from it.
+ */
+export function executorFor(client: Client): Executor {
+  return {
+    async query<T extends Record<string, unknown>>(sql: string, params: unknown[] = []) {
+      const res = await client.query(sql, params);
+      return res.rows as T[];
+    },
+    async queryOne<T extends Record<string, unknown>>(sql: string, params: unknown[] = []) {
+      const res = await client.query(sql, params);
+      return (res.rows[0] as T | undefined) ?? null;
+    },
+    async execute(sql: string, params: unknown[] = []) {
+      const res = await client.query(sql, params);
+      return res.rowCount ?? 0;
+    },
+  };
+}
+
+/**
+ * Connection limits are cluster-wide (`pg_roles.rolconnlimit`), so a test that
+ * must prove two *simultaneous* writers are mutually excluded has to raise the
+ * ceiling for the duration of that one probe. Production stays at the SAD
+ * §10.4 value; the limit is restored even when the assertion throws.
+ */
+export async function withRelayConnectionLimit<T>(limit: number, fn: () => Promise<T>): Promise<T> {
+  const previous = await adminQuery<{ rolconnlimit: number }>(
+    `SELECT rolconnlimit FROM pg_roles WHERE rolname = 'app_relay'`,
+  );
+  await adminExec(`ALTER ROLE app_relay CONNECTION LIMIT ${Number(limit)}`);
+  try {
+    return await fn();
+  } finally {
+    await adminExec(`ALTER ROLE app_relay CONNECTION LIMIT ${Number(previous[0]!.rolconnlimit)}`);
   }
 }

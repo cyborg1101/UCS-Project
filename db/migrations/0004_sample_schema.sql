@@ -83,10 +83,13 @@ CREATE POLICY tenant_isolation ON sample.aggregate_sequence
 -- Consumer state (K09)
 -- ---------------------------------------------------------------------
 CREATE TABLE sample.inbox (
-  consumer     text NOT NULL,
-  event_id     uuid NOT NULL,
-  tenant_id    uuid NOT NULL,
-  processed_at timestamptz NOT NULL DEFAULT now(),
+  consumer      text NOT NULL,
+  event_id      uuid NOT NULL,
+  tenant_id     uuid NOT NULL,
+  -- K09-T05: needed to detect a gap in an aggregate's sequence.
+  aggregate_id  uuid,
+  aggregate_seq bigint,
+  processed_at  timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (consumer, event_id)
 );
 CREATE INDEX inbox_tenant_idx ON sample.inbox (tenant_id, processed_at DESC);
