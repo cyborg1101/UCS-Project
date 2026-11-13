@@ -78,8 +78,8 @@ describe('[K02-T03] PUBLIC لا يملك USAGE ولا CONNECT', () => {
                 WHERE n.nspname IN ('sample','audit','messaging','kernel','platform')
                   AND has_schema_privilege('public', n.oid, 'USAGE')) AS pub_usage`,
     );
-    expect(row.pub_connect).toBe(false);
-    expect(row.pub_usage).toBe(0);
+    expect(row!.pub_connect).toBe(false);
+    expect(row!.pub_usage).toBe(0);
   });
 });
 
@@ -150,7 +150,7 @@ describe('[K02-T07] استنساخ قاعدة الاختبار سريع', () => 
       db.name,
       `SELECT count(*)::text AS n FROM public.schema_migrations`,
     );
-    expect(Number(rows[0].n)).toBeGreaterThanOrEqual(3);
+    expect(Number(rows[0]!.n)).toBeGreaterThanOrEqual(3);
     expect(TEMPLATE_DB).toBe('ucs_template');
   });
 });

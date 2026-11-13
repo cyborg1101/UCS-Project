@@ -9,8 +9,15 @@ export interface LoggerContext {
   tenant_id: string | null;
 }
 
-export function createLogger(opts: { level?: string; context?: () => LoggerContext } = {}): Logger {
-  return pino({
+export interface CreateLoggerOptions {
+  level?: string;
+  context?: () => LoggerContext;
+  /** Injectable sink (tests capture JSON here instead of patching stdout). */
+  destination?: NodeJS.WritableStream;
+}
+
+export function createLogger(opts: CreateLoggerOptions = {}): Logger {
+  const config = {
     level: opts.level ?? process.env.LOG_LEVEL ?? 'info',
     base: { service: process.env.SERVICE_NAME ?? 'ums' },
     mixin() {
@@ -22,7 +29,9 @@ export function createLogger(opts: { level?: string; context?: () => LoggerConte
       paths: ['req.headers.authorization', 'req.headers.cookie', '*.password', '*.token'],
       censor: '[REDACTED]',
     },
-  });
+  };
+
+  return opts.destination ? pino(config, opts.destination) : pino(config);
 }
 
 export type { Logger };
