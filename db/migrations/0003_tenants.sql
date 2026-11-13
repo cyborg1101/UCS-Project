@@ -24,6 +24,11 @@ ALTER TABLE platform.tenant ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS tenant_read ON platform.tenant;
 CREATE POLICY tenant_read ON platform.tenant FOR SELECT USING (true);
 
+-- USAGE on the schema is a separate privilege from SELECT on the table:
+-- without it the table grant is unreachable ("permission denied for
+-- schema platform"). Every app role resolves the tenant directory to map
+-- the caller's tenant_id to its public code, so it needs both.
+GRANT USAGE ON SCHEMA platform TO app_sample, app_relay, reporting_reader;
 GRANT SELECT ON platform.tenant TO app_sample, app_relay, reporting_reader;
 GRANT SELECT, INSERT, UPDATE ON platform.tenant TO migrator;
 

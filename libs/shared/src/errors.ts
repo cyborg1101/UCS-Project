@@ -99,3 +99,17 @@ export class IdempotencyKeyMissing extends AppError {
     super('IDEMPOTENCY_KEY_MISSING', 'errors.idempotency_key_missing', 400);
   }
 }
+
+/**
+ * The resource does not exist *within the caller's tenant*.
+ *
+ * Deliberately distinct from CrossTenantAccess: a row that belongs to another
+ * tenant must answer 403 (AC-039), because telling the caller "not found" would
+ * hide the fact that their identifier was valid and is being refused. 404 is
+ * reserved for ids that resolve to nothing at all.
+ */
+export class NotFound extends AppError {
+  constructor(details: ErrorDetails = {}) {
+    super('NOT_FOUND', 'errors.not_found', 404, details);
+  }
+}
