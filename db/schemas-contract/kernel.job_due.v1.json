@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "kernel.job_due.v1",
+  "title": "kernel.job_due v1",
+  "description": "A scheduled kernel job became due",
+  "type": "object",
+  "properties": {
+    "jobId": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "module": {
+      "type": "string"
+    },
+    "jobType": {
+      "type": "string"
+    },
+    "payload": {
+      "type": "object",
+      "additionalProperties": true,
+      "default": {}
+    }
+  },
+  "required": [
+    "jobId",
+    "module",
+    "jobType"
+  ]
+}

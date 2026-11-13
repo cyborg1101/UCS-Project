@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "sample.item_renamed.v1",
+  "title": "sample.item_renamed v1",
+  "description": "A sample module item was renamed",
+  "type": "object",
+  "properties": {
+    "itemId": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "from": {
+      "type": "string"
+    },
+    "to": {
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "required": [
+    "itemId",
+    "from",
+    "to"
+  ]
+}
