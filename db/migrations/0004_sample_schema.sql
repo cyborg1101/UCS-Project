@@ -70,6 +70,7 @@ CREATE TABLE sample.aggregate_sequence (
   tenant_id    uuid NOT NULL,
   last_seq     bigint NOT NULL DEFAULT 0
 );
+CREATE INDEX aggregate_sequence_tenant_idx ON sample.aggregate_sequence (tenant_id);
 ALTER TABLE sample.aggregate_sequence ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sample.aggregate_sequence FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON sample.aggregate_sequence
@@ -86,6 +87,7 @@ CREATE TABLE sample.inbox (
   processed_at timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (consumer, event_id)
 );
+CREATE INDEX inbox_tenant_idx ON sample.inbox (tenant_id, processed_at DESC);
 ALTER TABLE sample.inbox ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sample.inbox FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON sample.inbox
@@ -98,6 +100,7 @@ CREATE TABLE sample.offset (
   log_seq    bigint NOT NULL DEFAULT 0,
   updated_at timestamptz NOT NULL DEFAULT now()
 );
+CREATE INDEX offset_tenant_idx ON sample.offset (tenant_id);
 ALTER TABLE sample.offset ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sample.offset FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON sample.offset
@@ -118,6 +121,8 @@ CREATE TABLE sample.dead_letter (
   created_at    timestamptz NOT NULL DEFAULT now(),
   CONSTRAINT dlq_unique UNIQUE (consumer, event_id)
 );
+CREATE INDEX dead_letter_tenant_idx ON sample.dead_letter (tenant_id, created_at DESC);
+CREATE INDEX dead_letter_aggregate_idx ON sample.dead_letter (tenant_id, aggregate_id);
 ALTER TABLE sample.dead_letter ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sample.dead_letter FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON sample.dead_letter
