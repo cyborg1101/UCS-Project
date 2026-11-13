@@ -12,6 +12,8 @@ export const MESSAGE_KEYS = {
   'errors.event_contract_violation': { ar: 'حدث لا يطابق العقده', en: 'Event contract violation' },
   'errors.idempotency_key_missing': { ar: 'مفتاح التكرار مطلوب', en: 'Idempotency-Key required' },
   'errors.idempotency_key_reused': { ar: 'مفتاح التكرار مستعمل بحمولة مختلفة', en: 'Idempotency key reused' },
+  'errors.tenant_required': { ar: 'المستأجر مطلوب لهذه العملية', en: 'Tenant required' },
+  'errors.user_required': { ar: 'المستخدم مطلوب لهذه العملية', en: 'User required' },
   'errors.not_found': { ar: 'المورد غير موجود', en: 'Not found' },
   'errors.validation_failed': { ar: 'بيانات غير صحيحة', en: 'Validation failed' },
   'errors.rate_limited': { ar: 'تجاوزت حد الطلبات', en: 'Too many requests' },
