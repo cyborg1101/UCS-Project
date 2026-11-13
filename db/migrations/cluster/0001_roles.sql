@@ -14,7 +14,8 @@ BEGIN
       ('app_sample',         true,     3),
       ('app_relay',          true,     1),
       ('app_audit_chainer',  true,     1),
-      ('reporting_reader',   true,     4)
+      ('reporting_reader',   true,     4),
+      ('relay_reader',       false,   -1)  -- NOLOGIN owner of relay functions
     ) AS t(name, canlogin, connlimit)
   LOOP
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r.name) THEN
@@ -35,6 +36,9 @@ ALTER ROLE app_sample        NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE LOG
 ALTER ROLE app_relay         NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE LOGIN  CONNECTION LIMIT 1;
 ALTER ROLE app_audit_chainer NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE LOGIN  CONNECTION LIMIT 1;
 ALTER ROLE reporting_reader  NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE LOGIN  CONNECTION LIMIT 4;
+ALTER ROLE relay_reader      NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOLOGIN;
 
--- migrator must be able to create objects owned by owner_sample.
+-- migrator must be able to create objects owned by the module owner and to
+-- reassign ownership to the relay function owner.
 GRANT owner_sample TO migrator;
+GRANT relay_reader TO migrator;

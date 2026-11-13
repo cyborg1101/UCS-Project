@@ -61,8 +61,10 @@ CREATE INDEX outbox_unpublished_idx ON sample.outbox (tenant_id, aggregate_id, a
 ALTER TABLE sample.outbox ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sample.outbox FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON sample.outbox
-  USING  (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid)
-  WITH CHECK (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
+  USING  (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
+          OR pg_has_role(current_user, 'relay_reader', 'member'))
+  WITH CHECK (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
+          OR pg_has_role(current_user, 'relay_reader', 'member'));
 
 -- Monotonic per-aggregate sequence, serialised by a row lock (K08-T04).
 CREATE TABLE sample.aggregate_sequence (
@@ -159,6 +161,27 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON
 GRANT SELECT, INSERT ON sample.item TO reporting_reader;
 
 -- =====================================================================
+-- Ownership: the module owner role owns its objects (SAD §9), and FORCE RLS
+-- means even that owner is filtered by the tenant policy.
+-- =====================================================================
+ALTER TABLE sample.item               OWNER TO owner_sample;
+ALTER TABLE sample.outbox             OWNER TO owner_sample;
+ALTER TABLE sample.aggregate_sequence OWNER TO owner_sample;
+ALTER TABLE sample.inbox              OWNER TO owner_sample;
+ALTER TABLE sample.offset             OWNER TO owner_sample;
+ALTER TABLE sample.dead_letter        OWNER TO owner_sample;
+ALTER TABLE sample.idempotency_key    OWNER TO owner_sample;
+
+-- migrator still needs to create objects in the schema after the ownership
+-- transfer above (functions and their owner reassignment follow).
+GRANT ALL ON SCHEMA sample TO migrator;
+GRANT ALL ON ALL TABLES IN SCHEMA sample TO migrator;
+
+-- A new object owner must hold CREATE on the schema (PostgreSQL rule).
+-- relay_reader is NOLOGIN: reachable only via SET ROLE by migrator.
+GRANT USAGE, CREATE ON SCHEMA sample TO relay_reader;
+
+-- =====================================================================
 -- Functions
 -- =====================================================================
 
@@ -249,6 +272,15 @@ BEGIN
     RAISE EXCEPTION 'dead_letter % not found', p_id;
   END IF;
 END $$;
+
+-- Relay functions run as relay_reader (NOLOGIN, no BYPASSRLS) which is a
+-- member of itself, so pg_has_role inside the policy lets exactly this path
+-- through - and nothing else.
+ALTER FUNCTION sample.outbox_fetch(int)            OWNER TO relay_reader;
+ALTER FUNCTION sample.outbox_ack(uuid[])           OWNER TO relay_reader;
+ALTER FUNCTION sample.dlq_replay_aggregate(text, uuid) OWNER TO relay_reader;
+GRANT SELECT, INSERT, UPDATE, DELETE ON sample.outbox TO relay_reader;
+GRANT SELECT, UPDATE ON sample.dead_letter TO relay_reader;
 
 GRANT EXECUTE ON FUNCTION sample.next_aggregate_seq(uuid, uuid) TO app_sample;
 GRANT EXECUTE ON FUNCTION sample.outbox_fetch(int)                TO app_relay;
