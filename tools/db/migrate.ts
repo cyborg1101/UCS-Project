@@ -103,6 +103,56 @@ async function runDatabasePhase(): Promise<void> {
   });
 }
 
+/**
+ * Superuser phase. Event triggers and extensions that must not be reachable by
+ * the migration role live here. Applied against the app database, tracked in
+ * public.schema_migrations with a `su:` prefix so ordering stays auditable.
+ */
+async function runSuperuserPhase(): Promise<void> {
+  const files = sqlFiles('db/migrations/superuser');
+  if (files.length === 0) return;
+
+  const adminUrl = new URL(ADMIN_URL);
+  adminUrl.pathname = `/${DB_NAME}`;
+
+  await withClient(adminUrl.toString(), async (db) => {
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS public.schema_migrations (
+        version text PRIMARY KEY,
+        applied_at timestamptz NOT NULL DEFAULT now(),
+        checksum text NOT NULL
+      )
+    `);
+    const applied = new Set(
+      (await db.query<{ version: string }>('SELECT version FROM public.schema_migrations')).rows.map(
+        (r) => r.version,
+      ),
+    );
+
+    for (const file of files) {
+      const version = `su:${file.split('/').pop()!}`;
+      if (applied.has(version)) {
+        log(`skip (applied): ${version}`);
+        continue;
+      }
+      log(`apply (superuser): ${version}`);
+      const sql = readFileSync(file, 'utf8');
+      await db.query('BEGIN');
+      try {
+        await db.query(sql);
+        await db.query(
+          'INSERT INTO public.schema_migrations (version, checksum) VALUES ($1, md5($2))',
+          [version, sql],
+        );
+        await db.query('COMMIT');
+      } catch (err) {
+        await db.query('ROLLBACK');
+        throw new Error(`superuser migration ${version} failed: ${(err as Error).message}`);
+      }
+    }
+  });
+}
+
 async function rebuildTemplate(): Promise<void> {
   await withClient(ADMIN_URL, async (admin) => {
     // Terminate lingering sessions so DROP DATABASE can proceed.
@@ -145,6 +195,7 @@ async function main(): Promise<void> {
     return;
   }
   await runDatabasePhase();
+  await runSuperuserPhase();
   if (args.has('--template')) await rebuildTemplate();
   log('done');
 }
