@@ -265,6 +265,17 @@ AS $$
   VALUES (p_consumer, p_event_type) ON CONFLICT DO NOTHING
 $$;
 
+-- Head of the log (K09): a new consumer starts from "now" rather than replaying
+-- all history, and tests need a deterministic starting point.
+CREATE OR REPLACE FUNCTION messaging.max_log_seq()
+RETURNS bigint
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = messaging, public
+AS $$
+  SELECT coalesce(max(log_seq), 0) FROM messaging.event_log
+$$;
+
 -- Metrics (K08-T14).
 CREATE OR REPLACE FUNCTION messaging.outbox_unpublished_age(p_schema text)
 RETURNS interval
@@ -298,6 +309,7 @@ GRANT EXECUTE ON FUNCTION messaging.release_lease(bigint) TO app_relay;
 GRANT EXECUTE ON FUNCTION messaging.read_subscribed(text, bigint, int) TO app_relay, app_sample;
 GRANT EXECUTE ON FUNCTION messaging.subscribe(text, text) TO app_relay, app_sample;
 GRANT EXECUTE ON FUNCTION messaging.outbox_unpublished_age(text) TO app_relay;
+GRANT EXECUTE ON FUNCTION messaging.max_log_seq() TO app_sample, app_relay;
 
 SELECT messaging.ensure_month_partition(now());
 SELECT messaging.ensure_month_partition(now() + interval '1 month');

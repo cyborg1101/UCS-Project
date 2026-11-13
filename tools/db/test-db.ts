@@ -189,18 +189,30 @@ export function executorFor(client: Client): Executor {
 
 /**
  * Connection limits are cluster-wide (`pg_roles.rolconnlimit`), so a test that
- * must prove two *simultaneous* writers are mutually excluded has to raise the
- * ceiling for the duration of that one probe. Production stays at the SAD
- * §10.4 value; the limit is restored even when the assertion throws.
+ * must prove two *simultaneous* writers are mutually excluded - or that needs
+ * more sessions than the production pool allows - raises the ceiling for the
+ * duration of that one probe. Production keeps the SAD §10.4 value, and the
+ * limit is restored even when the assertion throws.
  */
-export async function withRelayConnectionLimit<T>(limit: number, fn: () => Promise<T>): Promise<T> {
+export async function withRoleConnectionLimit<T>(
+  role: string,
+  limit: number,
+  fn: () => Promise<T>,
+): Promise<T> {
   const previous = await adminQuery<{ rolconnlimit: number }>(
-    `SELECT rolconnlimit FROM pg_roles WHERE rolname = 'app_relay'`,
+    `SELECT rolconnlimit FROM pg_roles WHERE rolname = $1`,
+    [role],
   );
-  await adminExec(`ALTER ROLE app_relay CONNECTION LIMIT ${Number(limit)}`);
+  await adminExec(`ALTER ROLE ${role} CONNECTION LIMIT ${Number(limit)}`);
   try {
     return await fn();
   } finally {
-    await adminExec(`ALTER ROLE app_relay CONNECTION LIMIT ${Number(previous[0]!.rolconnlimit)}`);
+    await adminExec(
+      `ALTER ROLE ${role} CONNECTION LIMIT ${Number(previous[0]!.rolconnlimit)}`,
+    );
   }
+}
+
+export function withRelayConnectionLimit<T>(limit: number, fn: () => Promise<T>): Promise<T> {
+  return withRoleConnectionLimit('app_relay', limit, fn);
 }
